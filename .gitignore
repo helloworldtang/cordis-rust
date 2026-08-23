@@ -1,0 +1,6 @@
+# 构建产物
+/target
+
+# 环境文件
+.claude
+.DS_Store

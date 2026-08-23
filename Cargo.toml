@@ -1,0 +1,28 @@
+[package]
+name = "cordis-rust"
+version = "0.1.0"
+edition = "2024"
+description = "Cordis 插件框架的 Rust 实现：服务容器、依赖注入、类型化事件与可逆副作用"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/helloworldtang/cordis-rust"
+keywords = ["plugin", "dependency-injection", "framework", "async", "cordis"]
+categories = ["asynchronous", "architecture"]
+
+[lib]
+name = "cordis"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+
+[lints.rust]
+missing_docs = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
