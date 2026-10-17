@@ -3,12 +3,14 @@
 > 项目遗留问题清单。按"离 Cordis 本质的距离"排序；每条注明阻碍，
 > 避免下次调研重新推导。背景见 `docs/cordis-essence.md`。
 
-## 发布阻断（先于一切）
+## 发布备忘
 
-- [ ] **crates.io 包名被占**
+- [x] **crates.io 包名撞车已解决**（2026-10-17）
   crates.io 的 `cordis-rust` 是另一项目（redoop/cordis-rust，2026-08
-  发布 v0.2.1），与本仓库无关。本仓库以 git 依赖（锁 tag）分发；
-  若未来要上 crates.io 须先改名（连带 README/文档同步）。
+  发布 v0.2.1），与本仓库无关。解法：**v0.2.1 起包名改为
+  `cordis-harness`**（crates.io 可用；`cordis`/`cordis-core`/
+  `cordis-kernel` 均已被占）。库名仍为 `cordis`，`use cordis::` 不变；
+  GitHub 仓名 cordis-rust 保持不变。
 
 ## 架构债（"无特权内核"的最后拼图）
 

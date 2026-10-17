@@ -6,10 +6,11 @@ Cordis 是一个**插件框架**：插件向共享上下文贡献**服务**、**
 Rust 移植——dsh 的每一部分（模型适配器、工具注册表、会话日志、agent loop
 本身）都是 Cordis 插件，因此每一部分都可以从配置替换。
 
-> 包名是 `cordis-rust`，库名保持 `cordis`（Rust 标识符不含连字符）：
-> 依赖写 `cordis-rust`，代码里 `use cordis::…`。
-> crates.io 的 `cordis-rust` 名字已被另一项目占用（见"快速上手"注意），
-> 本仓库以 git 依赖分发。
+> 包名是 `cordis-harness`（crates.io），库名保持 `cordis`（Rust 标识符
+> 不含连字符）：依赖写 `cordis-harness`，代码里 `use cordis::…`。
+> crates.io 的 `cordis-rust` 是另一个同名项目
+> （[redoop/cordis-rust](https://github.com/redoop/cordis-rust)），
+> 与本仓库无关——v0.2.1 起本仓库以 `cordis-harness` 名义发布。
 
 ## 五个核心概念
 
@@ -23,14 +24,13 @@ Rust 移植——dsh 的每一部分（模型适配器、工具注册表、会�
 
 ## 快速上手
 
-> **注意**：crates.io 上的 `cordis-rust` 是另一个同名项目
-> （[redoop/cordis-rust](https://github.com/redoop/cordis-rust)），
-> 与本仓库无关。请勿 `cargo add cordis-rust`——请用下方锁 tag 的
-> git 依赖；引用滚动分支等于隐性升级到未审阅代码。
+> **注意**：请勿 `cargo add cordis-rust`——crates.io 上该名字属于另一
+> 个项目（[redoop/cordis-rust](https://github.com/redoop/cordis-rust)）。
+> 本仓库的包名是 `cordis-harness`。
 
 ```toml
 [dependencies]
-cordis-rust = { git = "https://github.com/helloworldtang/cordis-rust", tag = "v0.2.0" }
+cordis-harness = "0.2.1"   # 代码中 use cordis::…
 tokio = { version = "1", features = ["full"] }
 ```
 
