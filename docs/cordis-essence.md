@@ -163,19 +163,26 @@ async Drop（同步 Cleanup + `Service::stop` 钩子是语言约束下的正解�
 
 按"离本质的距离"排序：
 
-1. **`internal/get` / `internal/set` 拦截瀑布**——原版服务读写可被
-   拦截/替换（shadow、fallback 都靠它）。阻碍：Rust `get` 是同步快速
-   路径，承载不了异步瀑布；需要设计 async resolve API 或同步瀑布
-   监听形态。这是"无特权内核"最后一块未补的拼图。
-2. **typed 服务键**——`TypeId` 主键消 typo，`&'static str` 保配置
+1. **typed 服务键**——`TypeId` 主键消 typo，`&'static str` 保配置
    寻址（`trait ServiceKey { const NAME }` 双轨）。Bevy Resources 证明
    了 Rust 生态的主流路线；字符串键的价值在配置层，而配置层暂缺。
-3. **配置接缝**——描述符/工厂形态插件 + `fiber.update(Value)` +
+2. **配置接缝**——描述符/工厂形态插件 + `fiber.update(Value)` +
    `internal/update` 瀑布 + `InjectDecl` 带 intercept 配置。补齐后
    loader/patch/HMR 可以在不碰核心的前提下长出来；代价是 Plugin trait
    一次 breaking change。
-4. **proc-macro 装饰器**——`#[inject("database")]` / `derive(Plugin)`，
+3. **proc-macro 装饰器**——`#[inject("database")]` / `derive(Plugin)`，
    对应原版 `@Inject()`。
+
+已完成的路线图项（2026-10）：
+
+- **`internal/get` / `internal/set` 拦截瀑布**——以**同步瀑布监听形态**
+  落地（`on_waterfall_sync` / `SyncNext`）。方案考古结论：原版
+  waterfall 本就是同步的（`events.ts` 无 await，Proxy trap 物理上不能
+  异步），"Rust get 同步承载不了瀑布"的早期认知是反的；且整个 dsh
+  生态 200+ 包无插件监听这对事件（扩展点存在但未被使用）。同一轮
+  源码审计还补齐了 `provide_with_check`（`Impl.check`）、`set`
+  （`reflect.set`）、`internal/dispatch` 观测事件，并修复了根上下文
+  直供不唤醒下游的偏差（原版 provide 在 ACTIVE 态会 `notify`）。
 
 ## 七、原版 ↔ Rust 文件对照
 
@@ -184,8 +191,8 @@ async Drop（同步 Cleanup + `Service::stop` 钩子是语言约束下的正解�
 | `context.ts`（Context/proxy/isolate/intercept） | `context.rs`（Context/App/AppInner/isolate） | 语义保真；proxy→显式 get；intercept 未移植 |
 | `fiber.ts`（Fiber/状态机/effect/inertia） | `fiber.rs`（Fiber/FiberInner/refresh/run） | 保真；update/HMR 除外 |
 | `registry.ts`（Plugin 形态/Registry） | `registry.rs`（Plugin trait/FnPlugin/Registry） | 保真；键 = 实例指针 vs callback |
-| `events.ts`（五模式/filter） | `events.rs`（四模式/Contract/作用域过滤） | emit/waterfall/parallel/serial + 过滤保真；bail 未移植 |
-| `reflect.ts`（服务存储/notify/mixin/accessor） | `context.rs` 服务部分 + `RegistryService` | 存储与通知保真；mixin/accessor/internal-get-set 未移植 |
+| `events.ts`（五模式/filter） | `events.rs`（四模式+同步瀑布/Contract/作用域过滤） | emit/waterfall/parallel/serial + 同步瀑布（internal/get、set、dispatch）+ 过滤保真；bail/internal-listener 未移植 |
+| `reflect.ts`（服务存储/notify/mixin/accessor） | `context.rs` 服务部分 + `RegistryService` | 存储/通知/check 谓词/set/internal-get-set 保真；mixin/accessor 属语言机制未移植 |
 | `service.ts`（Service 基类/invoke/resolveConfig） | `service.rs`（Service trait/service_plugin） | 挂载模式保真；invoke/配置合并未移植 |
 | `utils.ts`（symbols/tracker/shadow） | ——（Rust 用类型与所有权表达） | 语言机制替代 |
 | `cosmokit`/`schemastery` 等 vendor | `thiserror`/`tokio`/std | 生态等价物 |

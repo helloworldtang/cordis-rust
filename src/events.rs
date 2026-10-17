@@ -1,4 +1,5 @@
-//! 类型化事件总线：`emit` / `waterfall` / `parallel` / `serial` 四种分发模式。
+//! 类型化事件总线：`emit` / `waterfall` / `parallel` / `serial` 四种分发
+//! 模式，另有拦截扩展点专用的同步瀑布形态（见模块文档末节）。
 //!
 //! 对应原版 `ctx.events`（EventsService）。事件的**分发模式是事件公开契约的
 //! 一部分**：每个事件名自首次注册起绑定一种模式与一种负载类型，此后用任何
@@ -11,9 +12,20 @@
 //! | 模式 | 是否等待 | 顺序 | 返回值 |
 //! |---|---|---|---|
 //! | `emit` | 否（触发即忘） | 注册顺序 | 无 |
-//! | `waterfall` | 是 | 注册顺序，先注册者在外层 | 链条最终值 |
+//! | `waterfall` | 是（async） | 注册顺序，先注册者在外层 | 链条最终值 |
 //! | `parallel` | 是 | 并发扇出 | 无（聚合错误） |
 //! | `serial` | 是 | 注册顺序 | 首个 `Some`（bail） |
+//! | `waterfall(sync)` | 是（同步） | 注册顺序，先注册者在外层 | 链条最终值 |
+//!
+//! ## 同步瀑布（拦截层）
+//!
+//! 原版 `waterfall` 本身是同步的（`next()` 直调直返，无 await）——它挂在
+//! Proxy get/set trap 里，物理上不可能异步。框架用这一形态实现服务读写的
+//! 拦截扩展点：`internal/get` / `internal/set`（见 [`event`] 常量），
+//! 对应 [`EventBus::waterfall_sync`] 与 [`crate::Context::on_waterfall_sync`]。
+//!
+//! **防死锁铁律**：同步瀑布的监听器执行绝不持任何锁——快照（records 锁）
+//! 释放后才走链，链尾的解析/写入再取服务锁；监听器内嵌套 `get` 因此安全。
 //!
 //! ## 派发上下文的流向
 //!
@@ -48,6 +60,33 @@ pub mod event {
     pub const STATUS: &str = "internal/status";
     /// 服务提供/撤销（负载 [`crate::ServiceEvent`]）。
     pub const SERVICE: &str = "internal/service";
+    /// 服务读取拦截（同步瀑布，值 [`crate::ServiceGet`]）。
+    ///
+    /// 派发点：`ctx.get` / `ctx.expect`。链尾初值是框架的真实解析结果，
+    /// 拦截者可改写（shadow）、补默认（fallback）或清空（否决）。框架
+    /// 内部的依赖就绪检查**不经过**此瀑布（对应原版 `_checkImpl` 直查
+    /// store），依赖图不受读拦截影响。
+    pub const GET: &str = "internal/get";
+    /// 服务写入拦截（同步瀑布，值 [`crate::ServiceSet`]）。
+    ///
+    /// 派发点：`ctx.provide`。拦截者可改写拟写入的服务名/值，或以 `Err`
+    /// 否决整个写入（错误传播给 provide 调用方）。
+    pub const SET: &str = "internal/set";
+    /// 事件即将分发（负载 [`crate::DispatchEvent`]）。
+    ///
+    /// 非框架事件的每次分发前触发（`internal/*` 自身豁免，防递归），
+    /// 携带分发模式与事件名——事件总线的统一观测点。原版还携带
+    /// 参数列表；类型化总线无法承载任意参数，这是有意的简化。
+    pub const DISPATCH: &str = "internal/dispatch";
+}
+
+/// `internal/dispatch` 事件的负载：一次公开分发的模式与事件名。
+#[derive(Debug, Clone)]
+pub struct DispatchEvent {
+    /// 分发模式。
+    pub mode: DispatchMode,
+    /// 被分发的事件名。
+    pub name: String,
 }
 
 /// 分发模式（见模块级文档的语义对照表）。
@@ -104,6 +143,15 @@ type NextErased = Box<
     dyn FnOnce(Context, Box<dyn Any + Send>) -> BoxFuture<'static, Result<Box<dyn Any + Send>>>
         + Send,
 >;
+/// 同步瀑布型监听器的类型擦除形态。
+type SyncWaterfallErased = Arc<
+    dyn Fn(Context, Box<dyn Any + Send>, SyncNextErased) -> Result<Box<dyn Any + Send>>
+        + Send
+        + Sync,
+>;
+/// 同步瀑布续体的类型擦除形态。
+type SyncNextErased =
+    Box<dyn FnOnce(Context, Box<dyn Any + Send>) -> Result<Box<dyn Any + Send>> + Send>;
 
 /// 事件总线内部状态。
 struct BusInner {
@@ -144,6 +192,8 @@ enum ContractKind {
     Waterfall,
     /// 串行决策者。
     Serial,
+    /// 同步瀑布包装层（拦截扩展点专用）。
+    SyncWaterfall,
 }
 
 impl Contract {
@@ -169,6 +219,15 @@ impl Contract {
     fn waterfall<T: Send + Sync + 'static>() -> Self {
         Self {
             kind: ContractKind::Waterfall,
+            payload: TypeId::of::<T>(),
+            ret: Some(TypeId::of::<T>()),
+        }
+    }
+
+    /// 同步瀑布形态的契约。
+    fn waterfall_sync<T: Send + Sync + 'static>() -> Self {
+        Self {
+            kind: ContractKind::SyncWaterfall,
             payload: TypeId::of::<T>(),
             ret: Some(TypeId::of::<T>()),
         }
@@ -200,11 +259,12 @@ pub(crate) struct HookMeta {
     scopes: HashMap<String, ScopeKey>,
 }
 
-/// 三种监听器形态的并集（与分发模式一一对应）。
+/// 各监听器形态的并集（与分发模式一一对应）。
 enum ListenerKind {
     Observe(ObserveErased),
     Serial(SerialErased),
     Waterfall(WaterfallErased),
+    SyncWaterfall(SyncWaterfallErased),
 }
 
 /// 链条/负载内部类型漂移（理论不可达的防御性分支：typed 包装器已约束类型）。
@@ -238,6 +298,7 @@ fn kind_label(kind: ContractKind) -> &'static str {
         ContractKind::Observe => "emit|parallel",
         ContractKind::Waterfall => "waterfall",
         ContractKind::Serial => "serial",
+        ContractKind::SyncWaterfall => "waterfall(sync)",
     }
 }
 
@@ -267,6 +328,34 @@ impl<T: Send + Sync + 'static> Next<T> {
             .downcast::<T>()
             .map(|boxed| *boxed)
             .map_err(|_| type_drift("waterfall chain value"))
+    }
+}
+
+/// 同步瀑布事件的续体（`next`）。
+///
+/// 与 [`Next`] 同构，但整条链在调用线程上同步执行——对应原版瀑布的
+/// 同步形态（Proxy trap 物理上不能异步）。语义一致：调用
+/// [`SyncNext::call`] 委托下游；不调用而直接返回即**短路**。
+///
+/// [`SyncNext`] 一次性消费：`call(self)` 按值获取。
+pub struct SyncNext<T> {
+    ctx: Context,
+    erased: SyncNextErased,
+    _marker: PhantomData<fn() -> T>,
+}
+
+impl<T: Send + Sync + 'static> SyncNext<T> {
+    /// 把值委托给下游监听器，返回链条最终值。
+    ///
+    /// # Errors
+    ///
+    /// 下游任一层监听器失败（沿链条向外传播）。
+    pub fn call(self, value: T) -> Result<T> {
+        let boxed = (self.erased)(self.ctx, Box::new(value))?;
+        boxed
+            .downcast::<T>()
+            .map(|boxed| *boxed)
+            .map_err(|_| type_drift("sync waterfall chain value"))
     }
 }
 
@@ -497,7 +586,71 @@ impl EventBus {
         Ok(id)
     }
 
+    /// 注册同步瀑布型监听器（拦截扩展点专用形态）。
+    ///
+    /// 与 [`Self::add_waterfall`] 同构，仅监听器返回值不是 future——
+    /// 整条链在分发调用线程上同步执行。
+    pub(crate) fn add_waterfall_sync<T, F>(
+        &self,
+        name: &str,
+        listener: F,
+        opts: ListenOptions,
+        scopes: HashMap<String, ScopeKey>,
+    ) -> Result<u64>
+    where
+        T: Send + Sync + 'static,
+        F: Fn(Context, T, SyncNext<T>) -> Result<T> + Send + Sync + 'static,
+    {
+        let id = self.alloc_id();
+        let listener = Arc::new(listener);
+        let wrapper: SyncWaterfallErased = Arc::new(
+            move |ctx: Context, boxed: Box<dyn Any + Send>, next: SyncNextErased| {
+                let value = boxed
+                    .downcast::<T>()
+                    .map_err(|_| type_drift("sync waterfall payload"))?;
+                let next = SyncNext {
+                    ctx: ctx.clone(),
+                    erased: next,
+                    _marker: PhantomData,
+                };
+                let out = listener(ctx, *value, next)?;
+                Ok(Box::new(out) as Box<dyn Any + Send>)
+            },
+        );
+        let meta = HookMeta {
+            id,
+            once: false,
+            global: opts.global,
+            scopes,
+        };
+        self.insert(
+            name,
+            Contract::waterfall_sync::<T>(),
+            ListenerKind::SyncWaterfall(wrapper),
+            opts.prepend,
+            meta,
+        )?;
+        Ok(id)
+    }
+
     // —— 分发 ——
+
+    /// 公开事件分发前的统一观测点（对应原版 `dispatch` 内的
+    /// `internal/dispatch` emit）。框架事件（`internal/*`）豁免，防递归。
+    fn report_dispatch(&self, ctx: &Context, mode: DispatchMode, name: &str) {
+        if name.starts_with("internal/") {
+            return;
+        }
+        let payload = DispatchEvent {
+            mode,
+            name: name.to_string(),
+        };
+        if let Err(error) = self.emit_inner(ctx, event::DISPATCH, payload, None) {
+            self.inner
+                .logger
+                .warn(format!("internal/dispatch 分发失败: {error}"));
+        }
+    }
 
     /// 取某事件的监听器快照并校验分发契约（锁在快照后立即释放）。
     ///
@@ -534,6 +687,7 @@ impl EventBus {
                 ListenerKind::Observe(f) => ListenerKind::Observe(Arc::clone(f)),
                 ListenerKind::Serial(f) => ListenerKind::Serial(Arc::clone(f)),
                 ListenerKind::Waterfall(f) => ListenerKind::Waterfall(Arc::clone(f)),
+                ListenerKind::SyncWaterfall(f) => ListenerKind::SyncWaterfall(Arc::clone(f)),
             })
             .collect();
         if record.hooks.iter().any(|hook| hook.once) {
@@ -591,6 +745,7 @@ impl EventBus {
     where
         T: Send + Sync + 'static,
     {
+        self.report_dispatch(ctx, DispatchMode::Emit, name);
         let hooks = self.snapshot(name, Contract::observe::<T>(), filter)?;
         let payload = Arc::new(payload) as Arc<dyn Any + Send + Sync>;
         for hook in hooks {
@@ -618,6 +773,7 @@ impl EventBus {
     where
         T: Send + Sync + 'static,
     {
+        self.report_dispatch(ctx, DispatchMode::Parallel, name);
         let hooks = self.snapshot(name, Contract::observe::<T>(), None)?;
         let payload = Arc::new(payload) as Arc<dyn Any + Send + Sync>;
         // 监听器 future 全部 'static：用独立任务实现真正的并发扇出
@@ -663,6 +819,7 @@ impl EventBus {
         T: Send + Sync + 'static,
         R: Send + 'static,
     {
+        self.report_dispatch(ctx, DispatchMode::Serial, name);
         let hooks = self.snapshot(name, Contract::serial::<T, R>(), None)?;
         let payload = Arc::new(payload) as Arc<dyn Any + Send + Sync>;
         for hook in hooks {
@@ -691,6 +848,7 @@ impl EventBus {
     where
         T: Send + Sync + 'static,
     {
+        self.report_dispatch(ctx, DispatchMode::Waterfall, name);
         let hooks = self.snapshot(name, Contract::waterfall::<T>(), None)?;
         let chain: Vec<WaterfallErased> = hooks
             .into_iter()
@@ -716,6 +874,48 @@ impl EventBus {
                     Box::pin(async move { listener(ctx, boxed, rest).await })
                 }
                 None => Box::pin(async move { Ok(boxed) }),
+            },
+        )
+    }
+
+    /// 同步瀑布分发：与 [`Self::waterfall`] 同构，整条链同步执行。
+    ///
+    /// 框架用于 `internal/get` / `internal/set` 拦截（对应原版 Proxy trap
+    /// 内的同步 waterfall）。快照释放 records 锁后才走链，监听器执行
+    /// 不持任何锁——链内嵌套 `get` / `provide` 安全。
+    ///
+    /// # Errors
+    ///
+    /// 契约不符，或任一层监听器失败（沿链条向外传播）。
+    pub fn waterfall_sync<T>(&self, ctx: &Context, name: &str, value: T) -> Result<T>
+    where
+        T: Send + Sync + 'static,
+    {
+        let hooks = self.snapshot(name, Contract::waterfall_sync::<T>(), None)?;
+        let chain: Vec<SyncWaterfallErased> = hooks
+            .into_iter()
+            .filter_map(|hook| match hook {
+                ListenerKind::SyncWaterfall(f) => Some(f),
+                _ => None,
+            })
+            .collect();
+        let next = Self::link_from_sync(chain.into_iter());
+        let boxed = next(ctx.clone(), Box::new(value))?;
+        boxed
+            .downcast::<T>()
+            .map(|boxed| *boxed)
+            .map_err(|_| type_drift("sync waterfall final value"))
+    }
+
+    /// 把同步瀑布监听器迭代器编成一条擦除续体链（链尾恒等）。
+    fn link_from_sync(mut iter: std::vec::IntoIter<SyncWaterfallErased>) -> SyncNextErased {
+        Box::new(
+            move |ctx: Context, boxed: Box<dyn Any + Send>| match iter.next() {
+                Some(listener) => {
+                    let rest = Self::link_from_sync(iter);
+                    listener(ctx, boxed, rest)
+                }
+                None => Ok(boxed),
             },
         )
     }

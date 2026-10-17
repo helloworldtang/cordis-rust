@@ -3,15 +3,14 @@
 > 项目遗留问题清单。按"离 Cordis 本质的距离"排序；每条注明阻碍，
 > 避免下次调研重新推导。背景见 `docs/cordis-essence.md`。
 
-## 架构债（"无特权内核"的最后拼图）
+## 发布阻断（先于一切）
 
-- [ ] **`internal/get` / `internal/set` 拦截瀑布**
-  原版服务读写可被拦截/替换（shadow、fallback 都靠它），是框架自举
-  的最后一块。阻碍：Rust `get` 是同步快速路径，承载不了异步瀑布；
-  需要先决定走 **async resolve API**（`ctx.resolve::<T>(name).await`
-  流经瀑布，`get` 保留为快速路径）还是 **同步瀑布监听形态**
-  （新增第三种 ListenerKind）。定了方案再动。
-  位置：`src/context.rs` `resolve_service_impl` / `expect`。
+- [ ] **crates.io 包名被占**
+  crates.io 的 `cordis-rust` 是另一项目（redoop/cordis-rust，2026-08
+  发布 v0.2.1），与本仓库无关。本仓库以 git 依赖（锁 tag）分发；
+  若未来要上 crates.io 须先改名（连带 README/文档同步）。
+
+## 架构债（"无特权内核"的最后拼图）
 
 - [ ] **typed 服务键（双轨）**
   `TypeId` 主键消 typo + `trait ServiceKey { const NAME }` 保诊断/
@@ -43,7 +42,7 @@
   若要恢复护栏：debug 构建下 get 未命中时打 warn（携带读取方 fiber
   名与服务名），零成本近似原版报错。
 
-## 功能缺口（依赖前两项架构债）
+## 功能缺口（依赖架构债与配置接缝）
 
 - [ ] **配置接缝**（前置：typed 键）
   描述符/工厂形态插件 + `fiber.update(Value)` + `internal/update`
@@ -57,6 +56,31 @@
   需新开 `cordis-macros` crate。
 
 ## 防回归备忘（实现期踩过、已修复）
+
+- [x] **`internal/get` / `internal/set` 拦截瀑布**（2026-10 已实现）
+  方案拍板：**同步瀑布监听形态**（`ListenerKind::SyncWaterfall` +
+  `on_waterfall_sync`）。关键考古结论：原版 waterfall 本就是同步的
+  （`events.ts` 的 `waterfall()` 无 await，挂在 Proxy trap 里也不可能
+  异步），"Rust get 同步承载不了瀑布"的认知是反的。生态证据：整个
+  dsh 200+ 包无任何插件监听 internal/get/set——扩展点存在但未被使用。
+  保真约束：依赖就绪检查绕过读拦截（原版 `_checkImpl` 直查 store）；
+  internal/set 环绕 `provide_arc`，终态 (name, value) 才是写入与撤销
+  的键（disposer 捕获终态键）。
+  **防死锁铁律**：同步瀑布的监听器执行绝不持任何锁——快照释放
+  records 锁后才走链，链内嵌套 `get`/`provide` 安全。
+
+- [x] **provide 直供唤醒缺失**（2026-10 已修复，勿回退）
+  根上下文直接 `provide` 此前只广播 `internal/service`、不调
+  `notify_service_change`（唤醒只发生在插件 fiber 转 Active 的
+  `notify_provided` 路径）——与原版 provide 在 ACTIVE 态的
+  `notify([name])` 不符。已补：`provide_arc` Active 分支同时唤醒。
+  由 `check_predicate_gates_dependency_readiness` 测试锚定。
+
+- [x] **check 谓词 / set 原位覆盖 / internal/dispatch**（2026-10 已实现）
+  对照原版源码全量审计后补齐的三项：`provide_with_check`（谓词只参与
+  依赖就绪、panic 按未就绪记日志）、`set`（仅提供方可写、不重新广播）、
+  `internal/dispatch` 观测事件（公开事件分发前触发，`internal/*` 豁免
+  防递归；不携带参数列表——类型化总线的有意简化）。
 
 - [x] **once 双触发**（已修复，勿回退）
   once 的自移除必须发生在**派发快照阶段**（`snapshot` 内同步摘除），

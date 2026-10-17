@@ -8,6 +8,8 @@ Rust 移植——dsh 的每一部分（模型适配器、工具注册表、会�
 
 > 包名是 `cordis-rust`，库名保持 `cordis`（Rust 标识符不含连字符）：
 > 依赖写 `cordis-rust`，代码里 `use cordis::…`。
+> crates.io 的 `cordis-rust` 名字已被另一项目占用（见"快速上手"注意），
+> 本仓库以 git 依赖分发。
 
 ## 五个核心概念
 
@@ -16,14 +18,19 @@ Rust 移植——dsh 的每一部分（模型适配器、工具注册表、会�
 | 插件是实现服务的对象 | 带 `inject` 依赖声明与 `apply(ctx)` 挂载体 | [`Plugin`] / [`Service`] trait |
 | 上下文是服务的容器 | 服务占据稳定的名字，按 key 查找而非导入实现 | [`Context`]（`provide` / `get`） |
 | 通过 `inject` 声明依赖 | 等服务就绪才启动，加载顺序由依赖表达 | [`Plugin::inject`] |
-| 类型化事件用于通信 | `emit` / `waterfall` / `parallel` / `serial` | [`EventBus`] |
+| 类型化事件用于通信 | `emit` / `waterfall` / `parallel` / `serial` + 同步瀑布拦截 | [`EventBus`] |
 | 注册是可逆的副作用 | reload 与 teardown 时按逆序撤销 | [`Context::effect`] / [`Disposer`] |
 
 ## 快速上手
 
+> **注意**：crates.io 上的 `cordis-rust` 是另一个同名项目
+> （[redoop/cordis-rust](https://github.com/redoop/cordis-rust)），
+> 与本仓库无关。请勿 `cargo add cordis-rust`——请用下方锁 tag 的
+> git 依赖；引用滚动分支等于隐性升级到未审阅代码。
+
 ```toml
 [dependencies]
-cordis-rust = "0.1"       # 代码中 use cordis::…
+cordis-rust = { git = "https://github.com/helloworldtang/cordis-rust", tag = "v0.2.0" }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -141,9 +148,13 @@ App ──► root fiber (uid 0, Active)
 - **服务**：`provide`（写入，返回 [`Disposer`]）/ `get::<T>`（返回
   `Option<Arc<T>>`）/ `expect::<T>`（返回精确错误）；
 - **插件**：`plugin`（挂载）/ `inject`（挂载等待依赖的闭包插件）；
+- **服务**：`provide` / `provide_with_check`（带可用性谓词，只影响依赖
+  就绪判定）/ `set`（提供方原位覆盖自己的服务值）注册与改写；
 - **副作用**：`effect`（登记清理动作）；
 - **事件**：`on` / `once` / `on_waterfall` / `on_serial` 注册，
   `emit` / `parallel` / `serial` / `waterfall` 分发；
+- **拦截**：`on_waterfall_sync` 注册同步瀑布监听器，挂到
+  `internal/get` / `internal/set` 即可 shadow / fallback / 否决服务读写；
 - **作用域**：`isolate` / `isolate_as` 派生隔离子上下文。
 
 原版用 Proxy 让 `ctx.foo` 即服务读取；Rust 没有动态属性，服务读取统一
@@ -292,17 +303,22 @@ Pending 队列，配合 [`Fiber::missing_dependencies`] 回答
 | 模式 | 是否等待 | 顺序 | 返回值 | 注册方法 |
 |---|---|---|---|---|
 | `emit` | 否（触发即忘） | 注册顺序 | 无（错误记日志） | `on` / `once` |
-| `waterfall` | 是 | 注册顺序，先注册者在外层 | 链条最终值 | `on_waterfall` |
+| `waterfall` | 是（async） | 注册顺序，先注册者在外层 | 链条最终值 | `on_waterfall` |
 | `parallel` | 是 | 并发扇出 | 无（聚合错误） | `on` / `once` |
 | `serial` | 是 | 注册顺序 | 首个 `Some`（bail） | `on_serial` |
+| `waterfall(sync)` | 是（同步） | 注册顺序，先注册者在外层 | 链条最终值 | `on_waterfall_sync` |
 
 - **一个事件一种形态**：`emit`/`parallel` 共享观察形态；`waterfall`、
-  `serial` 各有专属形态。混用即 `EventModeMismatch`；负载类型漂移在
-  注册时即被拒绝；
+  `serial`、`waterfall(sync)` 各有专属形态。混用即 `EventModeMismatch`；
+  负载类型漂移在注册时即被拒绝；
 - **waterfall 规则**：监听器收到 `(派发 ctx, 值, next)`。改写值后必须
   `next.call(value)` 委托下游；不调用而直接返回即**短路**——下游与
   链尾默认行为都不执行。单决策事件里短路是设计意图（策略监听器拥有
   决策权时不委托）；仅观察/标注的监听器必须委托；
+- **同步瀑布（拦截层）**：`on_waterfall_sync` 注册的监听器整条链同步
+  执行（对应原版 Proxy trap 内不能异步的 waterfall）。框架用它实现
+  服务读写拦截（见下表 `internal/get` / `internal/set`），shadow /
+  fallback / 否决都在这一层；
 - **prepend 慎用**：仅当监听器必须先于普通注册运行时设置
   （`ListenOptions { prepend: true }`，waterfall 中即更外层）；
 - **once**：监听器在派发快照阶段同步摘除，一次派发恰好消费一次；
@@ -339,6 +355,9 @@ Pending 队列，配合 [`Fiber::missing_dependencies`] 回答
 | `internal/plugin` | `Fiber` | 有插件 fiber 被创建 |
 | `internal/status` | `StatusEvent{fiber, prev, now}` | fiber 状态变化 |
 | `internal/service` | `ServiceEvent{name, value}` | 服务提供/撤销（**按作用域过滤**） |
+| `internal/get` | `ServiceGet{name, value}`（同步瀑布） | `get` / `expect` 读取服务：可改写（shadow）、补默认（fallback）、清空（否决）；框架内部依赖解析不经此层 |
+| `internal/set` | `ServiceSet{name, value}`（同步瀑布） | `provide` 写入前：可改写名/值（终态才是实际写入与撤销的键值），或 `Err` 否决 |
+| `internal/dispatch` | `DispatchEvent{mode, name}` | 公开事件分发前的统一观测点（`internal/*` 自身豁免防递归） |
 
 框架自举为三个内置服务（名字被占用，对应原版构造函数里安装
 events/logger/registry 的顺序）：`events`（事件总线本体）、
@@ -362,7 +381,7 @@ events/logger/registry 的顺序）：`events`（事件总线本体）、
 | 函数/类/`{apply}` 三种插件形态 | 单一 `Plugin` trait + `fn_plugin` 闭包适配 | 类型系统已排除非法形态 |
 | `ctx.foo` proxy 属性读取 | `ctx.get::<T>("foo")` | Rust 无动态属性 |
 | 配置经 schema 校验、`fiber.update()` 热更新 | 配置在插件构造期捕获 | v1 简化；热更新列为后续工作 |
-| `inject` 可携带 intercept 配置 | `inject` 只有服务名 | intercept/配置拦截未移植 |
+| `inject` 可携带 intercept 配置 | `inject` 只有服务名 | 配置注入未移植（属配置接缝）；服务读写拦截已以 `internal/get`/`internal/set` 同步瀑布补齐 |
 | disposer 可为异步/Promise/生成器 | 清理为同步闭包 | 大多数清理是注销动作；异步收尾放 `Service::stop` |
 | fiber 名继承最近具名祖先 | 直接用插件名 | 简化诊断 |
 | `bail` 分发（同步版 serial） | 未实现 | 与 serial 语义重合 |
@@ -407,11 +426,23 @@ v1 完成后做过一轮源码级审计（详见 [`docs/cordis-essence.md`](docs
   挂载到根上下文，可寻址、可注入；新增 `Fiber::missing_dependencies`
   与 `RegistryService::pending` 诊断静默 PENDING；
 - **RAII 守卫**：`ctx.guard` 返回 Drop 即撤销的 [`EffectGuard`]，
-  与 Cordis 语义的 [`Disposer`] 并存。
+  与 Cordis 语义的 [`Disposer`] 并存；
+- **读写拦截瀑布**：原版 Proxy trap 内的 `internal/get` / `internal/set`
+  同步 waterfall 已移植为 `on_waterfall_sync`（读原版源码确认其瀑布
+  本就是同步形态——Proxy trap 物理上不能异步），shadow / fallback /
+  否决语义与原版一致，框架依赖解析不受读拦截影响；
+- **provide 直供唤醒**：根上下文直接 `provide` 此前只广播事件、不唤醒
+  下游（唤醒只发生在插件 fiber 转 Active 的路径上）——与原版 provide
+  在 ACTIVE 态 `notify([name])` 不符，已补 `notify_service_change`；
+- **可用性谓词**：`provide_with_check` 补齐原版 `Impl.check` /
+  `_checkImpl`——谓词只参与依赖就绪判定，不影响读取；谓词 panic 按
+  未就绪处理并记日志；
+- **原位覆盖**：`set` 补齐原版 `reflect.set`——仅提供方可改写自己的
+  服务值，不重新广播；
+- **分发观测**：`internal/dispatch` 补齐原版 dispatch 内的统一观测点
+  （公开事件分发前携带模式与事件名触发）。
 
-仍未补的（记录在理解文档的路线图）：服务读写的 `internal/get` / `internal/set`
-拦截瀑布（Rust 的同步 `get` 无法承载异步瀑布，需要异步 resolve API）、
-typed 服务键、配置接缝。
+仍未补的（记录在理解文档的路线图）：typed 服务键、配置接缝。
 
 ## 未实现清单（寻求方案）
 
@@ -420,13 +451,6 @@ v1 相对原版 Cordis 的核心语义已全部落地并有测试锚定；下面
 如果你对其中某条有成熟方案（或想直接认领），欢迎开 issue / PR 讨论。
 
 ### 架构债（"无特权内核"的最后拼图）
-
-- [ ] **`internal/get` / `internal/set` 拦截瀑布**
-  原版的服务读写可被拦截/替换（shadow、fallback 实现都靠它），是框架
-  自举的最后一块。**阻碍**：Rust 的 `get` 是同步快速路径，承载不了异步
-  瀑布。候选方向：① async resolve API——`ctx.resolve::<T>(name).await`
-  流经瀑布，`get` 保留为快速路径；② 新增第三种 ListenerKind，做同步
-  瀑布监听形态。需要先定方案再动手。
 
 - [ ] **typed 服务键（双轨）**
   `TypeId` 主键消 typo + `trait ServiceKey { const NAME }` 保诊断与

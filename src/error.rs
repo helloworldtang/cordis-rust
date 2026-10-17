@@ -64,6 +64,16 @@ pub enum CordisError {
         owner: String,
     },
 
+    /// 覆盖了非当前 fiber 提供的服务（对应原版 `reflect.set` 的
+    /// "in multiple fibers" 报错）：只有提供方能原位改写自己的服务值。
+    #[error("cannot set service {name:?} provided at <{owner}>")]
+    SetByNonOwner {
+        /// 服务名。
+        name: String,
+        /// 实际提供方 fiber 名。
+        owner: String,
+    },
+
     /// 事件的使用方式与其声明的分发模式不符。
     ///
     /// 每个事件名只允许一种分发模式（`emit` / `waterfall` / `parallel` /
@@ -115,6 +125,7 @@ impl CordisError {
             Self::ServiceNotProvided(_) => "SERVICE_NOT_PROVIDED",
             Self::ServiceTypeMismatch { .. } => "SERVICE_TYPE_MISMATCH",
             Self::AlreadyProvided { .. } => "ALREADY_PROVIDED",
+            Self::SetByNonOwner { .. } => "SET_BY_NON_OWNER",
             Self::EventModeMismatch { .. } => "EVENT_MODE_MISMATCH",
             Self::EventPayloadMismatch { .. } => "EVENT_PAYLOAD_MISMATCH",
             Self::ParallelDispatchFailed { .. } => "PARALLEL_DISPATCH_FAILED",

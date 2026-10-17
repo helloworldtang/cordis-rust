@@ -1,6 +1,6 @@
 [package]
 name = "cordis-rust"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Cordis 插件框架的 Rust 实现：服务容器、依赖注入、类型化事件与可逆副作用"
 license = "MIT"

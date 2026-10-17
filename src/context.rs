@@ -18,6 +18,12 @@
 //! 走 `ctx.get::<T>("foo")`。未声明 `inject` 就读取服务在原版是运行时
 //! 报错，Rust 版将"读取"与"依赖等待"解耦：`get` 返回 `Option`，
 //! "等待就绪再启动"的语义由 [`crate::Plugin::inject`] 全权承担。
+//!
+//! 原版 Proxy trap 内的 `internal/get` / `internal/set` 同步拦截瀑布已
+//! 移植：`get` / `expect` / `provide` 分别流经 [`crate::event::GET`] /
+//! [`crate::event::SET`]（同步瀑布，见 [`Context::on_waterfall_sync`]），
+//! shadow / fallback / 否决语义与原版一致；框架内部的依赖就绪检查
+//! 不经过拦截（对应原版 `_checkImpl` 直查 store）。
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -37,6 +43,12 @@ use crate::{ListenOptions, ROOT_SCOPE, ScopeKey, event};
 /// 服务值在存储中的擦除形态。
 type AnyService = Arc<dyn Any + Send + Sync>;
 
+/// 服务可用性谓词的擦除形态（对应原版 `Impl.check`）。
+type CheckFn = Arc<dyn Fn(&AnyService) -> bool + Send + Sync>;
+
+/// 可用性谓词的强类型形态（`provide_with_check` 的入参）。
+type TypedCheck<T> = Arc<dyn Fn(&T) -> bool + Send + Sync>;
+
 /// 一条服务实现记录（对应原版 `ReflectService.Impl`）。
 struct ServiceImpl {
     /// 服务值。
@@ -45,6 +57,9 @@ struct ServiceImpl {
     type_name: &'static str,
     /// 提供方 fiber（弱引用：fiber 由注册表与父级保活）。
     fiber: Weak<FiberInner>,
+    /// 可用性谓词：只参与依赖就绪判定（提供方 Active 之外的第二道闸），
+    /// 不影响已就绪依赖方的读取。
+    check: Option<CheckFn>,
 }
 
 /// `internal/service` 事件的负载。
@@ -54,6 +69,29 @@ pub struct ServiceEvent {
     pub name: String,
     /// 新的服务值；撤销时为 `None`。
     pub value: Option<AnyService>,
+}
+
+/// `internal/get` 同步瀑布的值：服务名 + 解析结果。
+///
+/// 链尾初值是框架的真实解析结果；拦截者可改写值（shadow）、补默认
+/// （fallback）、清空（否决）。`name` 随链下传，拦截者可据此分流。
+#[derive(Clone)]
+pub struct ServiceGet {
+    /// 被读取的服务名。
+    pub name: String,
+    /// 解析结果；`None` 表示未提供（或被拦截者清空）。
+    pub value: Option<AnyService>,
+}
+
+/// `internal/set` 同步瀑布的值：拟写入的服务名 + 值。
+///
+/// 拦截者可改写名/值（改写后的终态才是实际写入与撤销的键值），
+/// 或返回 `Err` 否决整个写入（错误传播给 provide 调用方）。
+pub struct ServiceSet {
+    /// 拟提供的服务名。
+    pub name: String,
+    /// 拟提供的服务值（已是擦除形态）。
+    pub value: AnyService,
 }
 
 /// 向下转型：成功给值，失败给带注册类型名的精确错误。
@@ -479,6 +517,76 @@ impl Context {
         Some(Arc::clone(&impl_.value))
     }
 
+    /// 依赖就绪判定（对应原版 `_checkImpl`）：解析成功 + 可用性谓词通过。
+    ///
+    /// 谓词 panic 视作不可用并记日志（对应原版 catch 后按未满足处理）；
+    /// `notify_service_change` 之后 fiber 会再次咨询，谓词恢复即自动就绪。
+    pub(crate) fn dependency_ready(&self, name: &str) -> bool {
+        let key = self.scope_key_for(name);
+        let app = &self.inner.app;
+        let services = lock!(app.services);
+        let Some(impl_) = services.get(&(key, name.to_string())) else {
+            return false;
+        };
+        let Some(provider) = impl_.fiber.upgrade() else {
+            return false;
+        };
+        if provider.state() != FiberState::Active {
+            return false;
+        }
+        if let Some(check) = &impl_.check {
+            let verdict =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(&impl_.value)));
+            match verdict {
+                Ok(true) => {}
+                Ok(false) => return false,
+                Err(panic) => {
+                    drop(services);
+                    app.logger.error(format!(
+                        "服务 {name:?} 的可用性谓词 panic：{panic:?}，按未就绪处理"
+                    ));
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// 原位覆盖当前 fiber 已提供服务的值（对应原版 `reflect.set`）。
+    ///
+    /// 只有提供本服务的 fiber 可覆盖；不重新广播、不改变归属与撤销键
+    /// （读取方下次 `get` 即见新值）。需要"重新走提供流程"（拦截瀑布、
+    /// 广播唤醒）时应撤销后重新 [`Self::provide`]。
+    ///
+    /// # Errors
+    ///
+    /// 服务未提供，或由其他 fiber 提供。
+    pub fn set<T>(&self, name: &str, value: Arc<T>) -> Result<()>
+    where
+        T: Send + Sync + 'static,
+    {
+        let fiber = self.fiber()?.0;
+        let key = self.scope_key_for(name);
+        let app = self.app();
+        let mut services = lock!(app.services);
+        let Some(impl_) = services.get_mut(&(key, name.to_string())) else {
+            return Err(CordisError::ServiceNotProvided(name.to_string()));
+        };
+        if impl_.fiber.as_ptr() != Arc::as_ptr(&fiber) {
+            let owner = impl_
+                .fiber
+                .upgrade()
+                .map_or_else(|| "<gone>".into(), |f| f.display_name().to_string());
+            return Err(CordisError::SetByNonOwner {
+                name: name.to_string(),
+                owner,
+            });
+        }
+        impl_.value = value;
+        impl_.type_name = std::any::type_name::<T>();
+        Ok(())
+    }
+
     // —— 服务 ——
 
     /// 提供一个服务（当前 fiber 拥有其生命周期）。
@@ -494,52 +602,122 @@ impl Context {
     where
         T: Send + Sync + 'static,
     {
-        self.provide_arc(name, Arc::new(value))
+        self.provide_arc_with_check(name, Arc::new(value), None)
     }
 
     /// [`Self::provide`] 的共享引用版本（服务实例被多方持有时避免复制）。
     ///
+    /// 写入流经 [`event::SET`](crate::event::SET) 同步瀑布：拦截者可改写
+    /// 拟写入的名/值，或以 `Err` 否决；终态 (name, value) 才是实际写入与
+    /// 撤销的对象（disposer 捕获终态键，拦截者改名也能正确撤销）。
+    ///
+    /// # Errors
+    ///
+    /// 拦截链失败（否决），或同 [`Self::provide`]。
+    pub fn provide_arc<T>(&self, name: &str, value: Arc<T>) -> Result<crate::Disposer>
+    where
+        T: Send + Sync + 'static,
+    {
+        self.provide_arc_with_check(name, value, None)
+    }
+
+    /// [`Self::provide`] 带可用性谓词版本（对应原版 `ctx.provide` 的
+    /// 第三参数 `check`）。
+    ///
+    /// `check` 只参与**依赖就绪判定**：注入该服务的 fiber 在谓词返回
+    /// `false` 期间保持等待，如同服务未提供；谓词不影响已就绪依赖方的
+    /// 读取（与原版 `_checkImpl` 的咨询点一致）。
+    ///
     /// # Errors
     ///
     /// 同 [`Self::provide`]。
-    pub fn provide_arc<T>(&self, name: &str, value: Arc<T>) -> Result<crate::Disposer>
+    pub fn provide_with_check<T>(
+        &self,
+        name: &str,
+        value: T,
+        check: impl Fn(&T) -> bool + Send + Sync + 'static,
+    ) -> Result<crate::Disposer>
+    where
+        T: Send + Sync + 'static,
+    {
+        self.provide_arc_with_check(name, Arc::new(value), Some(Arc::new(check)))
+    }
+
+    /// 全量提供路径：值 + 可选可用性谓词（擦除形态）。
+    ///
+    /// # Errors
+    ///
+    /// 同 [`Self::provide`]。
+    fn provide_arc_with_check<T>(
+        &self,
+        name: &str,
+        value: Arc<T>,
+        check: Option<TypedCheck<T>>,
+    ) -> Result<crate::Disposer>
     where
         T: Send + Sync + 'static,
     {
         let fiber = self.fiber()?.0;
         fiber.assert_active()?;
+        // internal/set 拦截瀑布：无监听器时快照为空、直通。占用检查与
+        // 写入在瀑布之后，作用域键按终态名计算
+        let original: AnyService = value;
+        let proposed = ServiceSet {
+            name: name.to_string(),
+            value: Arc::clone(&original),
+        };
+        let settled = self.app().bus.waterfall_sync(self, event::SET, proposed)?;
+        let name = &settled.name;
+        let value = settled.value;
+        // 拦截者改写过则注册类型名已失真，用占位说明
+        let type_name = if Arc::ptr_eq(&value, &original) {
+            std::any::type_name::<T>()
+        } else {
+            "<intercepted>"
+        };
         let key = self.scope_key_for(name);
         let app = self.app();
         // 广播用副本：本体 move 进存储，避免"借而不取"
-        let shared = Arc::clone(&value) as AnyService;
+        let shared = Arc::clone(&value);
+        // 谓词擦除：拦截至原值时按 T 向下转型咨询；拦截者换值致类型漂移
+        // 则视作不可用（保真原版 check 以注册值为 this 的语义）
+        let erased_check: Option<CheckFn> = check.map(|check| {
+            let erased: CheckFn = Arc::new(move |value: &AnyService| {
+                value.downcast_ref::<T>().is_some_and(|typed| check(typed))
+            });
+            erased
+        });
         {
             let mut services = lock!(app.services);
-            if let Some(existing) = services.get(&(key, name.to_string())) {
+            if let Some(existing) = services.get(&(key, name.clone())) {
                 let owner = existing
                     .fiber
                     .upgrade()
                     .map_or_else(|| "<gone>".into(), |f| f.display_name().to_string());
                 return Err(CordisError::AlreadyProvided {
-                    name: name.to_string(),
+                    name: name.clone(),
                     owner,
                 });
             }
             services.insert(
-                (key, name.to_string()),
+                (key, name.clone()),
                 ServiceImpl {
                     value,
-                    type_name: std::any::type_name::<T>(),
+                    type_name,
                     fiber: Arc::downgrade(&fiber),
+                    check: erased_check,
                 },
             );
         }
 
         // 广播 + 唤醒下游（提供方须已 Active，Loading 期间的提供由
-        // 状态切换到 Active 时的 notify_provided 统一广播）
+        // 状态切换到 Active 时的 notify_provided 统一广播；直接提供路径
+        // 对应原版 provide 在 ACTIVE 态的 notify([name])）
         if fiber.state() == FiberState::Active {
             self.announce_service(name, Some(shared));
+            self.app().notify_service_change(name);
         }
-        let name_owned = name.to_string();
+        let name_owned = name.clone();
         let app = Arc::clone(app);
         let ctx_self = self.clone();
         let (slot, disposer) = crate::effect::Disposer::from_cleanup(
@@ -577,6 +755,10 @@ impl Context {
 
     /// 读取服务；未提供（或提供方未就绪）时返回 `None`。
     ///
+    /// 读取流经 [`event::GET`](crate::event::GET) 同步瀑布：拦截者可
+    /// 改写值（shadow）、补默认（fallback）或清空（否决）；无监听器时
+    /// 直通，行为与裸解析一致。
+    ///
     /// "读取"与"依赖等待"解耦：需要等待语义时应声明
     /// [`Plugin::inject`](crate::Plugin::inject)。
     #[must_use]
@@ -584,29 +766,63 @@ impl Context {
     where
         T: Send + Sync + 'static,
     {
-        let value = self.resolve_service_impl(name)?;
-        value.downcast::<T>().ok()
+        let query = ServiceGet {
+            name: name.to_string(),
+            value: self.resolve_service_impl(name),
+        };
+        let query = match self.app().bus.waterfall_sync(self, event::GET, query) {
+            Ok(query) => query,
+            // get 无错误通道（与 downcast 失败返 None 的静默策略一致）：
+            // 拦截链失败记日志，服务视作不可读
+            Err(error) => {
+                self.app()
+                    .logger
+                    .warn(format!("internal/get 拦截链失败: {error}"));
+                return None;
+            }
+        };
+        query.value.and_then(|value| value.downcast::<T>().ok())
     }
 
     /// 读取服务，类型不符或未提供时给出精确错误。
     ///
+    /// 与 [`Self::get`] 流经同一条 [`event::GET`](crate::event::GET)
+    /// 拦截瀑布；拦截链的错误在此直接传播（expect 有 `Result` 通道）。
+    ///
     /// # Errors
     ///
-    /// [`CordisError::ServiceNotProvided`] 或 [`CordisError::ServiceTypeMismatch`]。
+    /// 拦截链失败、[`CordisError::ServiceNotProvided`] 或
+    /// [`CordisError::ServiceTypeMismatch`]。
     pub fn expect<T>(&self, name: &str) -> Result<Arc<T>>
     where
         T: Send + Sync + 'static,
     {
         let key = self.scope_key_for(name);
         let app = &self.inner.app;
-        {
+        // 初值走裸查（不要求提供方 Active，与既有 expect 语义一致），
+        // 同时记下注册类型名供类型错误的精确诊断
+        let initial: Option<(AnyService, &'static str)> = {
             let services = lock!(app.services);
-            if let Some(impl_) = services.get(&(key, name.to_string())) {
-                return value_or_type_error(&impl_.value, impl_.type_name, name);
+            services
+                .get(&(key, name.to_string()))
+                .map(|impl_| (Arc::clone(&impl_.value), impl_.type_name))
+        };
+        let query = ServiceGet {
+            name: name.to_string(),
+            value: initial.as_ref().map(|(value, _)| Arc::clone(value)),
+        };
+        let query = self.app().bus.waterfall_sync(self, event::GET, query)?;
+        match query.value {
+            Some(value) => {
+                // 拦截者改写过则注册类型名已失真，用占位说明
+                let actual = initial
+                    .filter(|(original, _)| Arc::ptr_eq(&value, original))
+                    .map_or("<intercepted>", |(_, type_name)| type_name);
+                value_or_type_error(&value, actual, name)
             }
+            // 提供方未就绪（或未提供/被否决）统一视作不可用
+            None => Err(CordisError::ServiceNotProvided(name.to_string())),
         }
-        // 提供方未就绪（或未提供）统一视作不可用
-        Err(CordisError::ServiceNotProvided(name.to_string()))
     }
 
     // —— 插件 ——
@@ -880,6 +1096,49 @@ impl Context {
         self.wrap_listener_removal(name, id)
     }
 
+    /// 注册同步瀑布型监听器（拦截扩展点的事件形态）。
+    ///
+    /// 监听器收到 `(派发方上下文, 值, next)`，整条链同步执行——这是
+    /// [`event::GET`] / [`event::SET`] 等框架自举扩展点的监听形态
+    /// （对应原版 Proxy trap 内的同步 waterfall）。需要先于既有拦截器
+    /// 运行时用 [`Self::on_waterfall_sync_opt`] 设置 `prepend`。
+    ///
+    /// # Errors
+    ///
+    /// 事件的模式/负载类型契约不符，或当前 fiber 已失活。
+    pub fn on_waterfall_sync<T, F>(&self, name: &str, listener: F) -> Result<crate::Disposer>
+    where
+        T: Send + Sync + 'static,
+        F: Fn(Context, T, crate::events::SyncNext<T>) -> Result<T> + Send + Sync + 'static,
+    {
+        self.on_waterfall_sync_opt(name, listener, ListenOptions::default())
+    }
+
+    /// [`Self::on_waterfall_sync`] 带选项版本。
+    ///
+    /// # Errors
+    ///
+    /// 同 [`Self::on_waterfall_sync`]。
+    pub fn on_waterfall_sync_opt<T, F>(
+        &self,
+        name: &str,
+        listener: F,
+        options: ListenOptions,
+    ) -> Result<crate::Disposer>
+    where
+        T: Send + Sync + 'static,
+        F: Fn(Context, T, crate::events::SyncNext<T>) -> Result<T> + Send + Sync + 'static,
+    {
+        self.fiber()?.0.assert_active()?;
+        let id = self.app().bus.add_waterfall_sync::<T, F>(
+            name,
+            listener,
+            options,
+            self.isolate_snapshot(),
+        )?;
+        self.wrap_listener_removal(name, id)
+    }
+
     /// 把监听器移除动作登记为当前 fiber 的副作用。
     fn wrap_listener_removal(&self, name: &str, id: u64) -> Result<crate::Disposer> {
         let bus = self.app().bus.clone();
@@ -942,6 +1201,18 @@ impl Context {
         T: Send + Sync + 'static,
     {
         self.app().bus.waterfall(self, name, value).await
+    }
+
+    /// 同步瀑布分发（拦截扩展点的事件形态，整条链同步执行）。
+    ///
+    /// # Errors
+    ///
+    /// 事件契约不符，或任一层监听器失败。
+    pub fn waterfall_sync<T>(&self, name: &str, value: T) -> Result<T>
+    where
+        T: Send + Sync + 'static,
+    {
+        self.app().bus.waterfall_sync(self, name, value)
     }
 
     // —— 作用域 ——

@@ -10,7 +10,8 @@
 //! 3. **通过 `inject` 声明依赖** —— 插件等待所需服务就绪才启动，
 //!    加载顺序由依赖表达，而非手动编排；
 //! 4. **类型化事件用于通信** —— [`EventBus`] 的 `emit` / `waterfall` /
-//!    `parallel` / `serial` 四种分发模式；
+//!    `parallel` / `serial` 四种分发模式，加上服务读写拦截专用的同步
+//!    瀑布形态；
 //! 5. **注册是可逆的副作用** —— [`Context::effect`] / [`Disposer`] 与
 //!    RAII 形态的 [`Context::guard`] / [`EffectGuard`]，
 //!    reload 与 teardown 时逆序撤销。
@@ -75,10 +76,10 @@ pub mod logger;
 pub mod registry;
 pub mod service;
 
-pub use context::{App, Context, RegistryService, ServiceEvent};
+pub use context::{App, Context, RegistryService, ServiceEvent, ServiceGet, ServiceSet};
 pub use effect::{Cleanup, Disposer, EffectGuard};
 pub use error::{CordisError, Result};
-pub use events::{BoxFuture, DispatchMode, EventBus, Next, event};
+pub use events::{BoxFuture, DispatchEvent, DispatchMode, EventBus, Next, SyncNext, event};
 pub use fiber::{Fiber, FiberState, StatusEvent};
 pub use logger::{Level, Logger};
 pub use registry::{FnPlugin, Plugin, fn_plugin};
@@ -112,7 +113,7 @@ pub mod prelude {
     pub use crate::EffectGuard;
     pub use crate::context::{App, Context};
     pub use crate::error::{CordisError, Result};
-    pub use crate::events::Next;
+    pub use crate::events::{Next, SyncNext};
     pub use crate::fiber::{Fiber, FiberState};
     pub use crate::registry::{Plugin, fn_plugin};
     pub use crate::service::{Service, service_plugin};

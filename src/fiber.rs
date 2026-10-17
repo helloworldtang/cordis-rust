@@ -245,7 +245,7 @@ impl Fiber {
         self.0
             .inject
             .iter()
-            .filter(|name| ctx.resolve_service_impl(name).is_none())
+            .filter(|name| !ctx.dependency_ready(name))
             .cloned()
             .collect()
     }
@@ -340,15 +340,13 @@ impl FiberInner {
         }
     }
 
-    /// 全部注入服务是否就绪（提供方须为 Active）。
+    /// 全部注入服务是否就绪（提供方须为 Active，且可用性谓词通过）。
     fn deps_satisfied(&self) -> bool {
         if self.inject.is_empty() {
             return true;
         }
         let ctx = self.ctx();
-        self.inject
-            .iter()
-            .all(|name| ctx.resolve_service_impl(name).is_some())
+        self.inject.iter().all(|name| ctx.dependency_ready(name))
     }
 
     /// 依赖变化后重估：需要转换且当前空闲时驱动一次。
