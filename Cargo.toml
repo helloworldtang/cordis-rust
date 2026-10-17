@@ -7,7 +7,7 @@ license = "MIT"
 readme = "README.md"
 repository = "https://github.com/helloworldtang/cordis-rust"
 keywords = ["plugin", "dependency-injection", "framework", "async", "cordis"]
-categories = ["asynchronous", "architecture"]
+categories = ["asynchronous", "concurrency"]
 
 [lib]
 name = "cordis"
