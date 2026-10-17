@@ -1,0 +1,45 @@
+# 从 tag 发版：质量门全过 → OIDC 换取 crates.io 短期 token → publish。
+# 无长期凭证：crates.io 侧须预先配置 Trusted Publisher
+# （仓库名 / workflow 文件名 release.yml / environment 留空）。
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  id-token: write # OIDC token 交换必需
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # 质量门：与本地门槛一致，不过则中止发布
+      - name: fmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test
+        run: cargo test
+
+      # tag 与 Cargo.toml version 一致性：防止 tag 名与发布版本漂移
+      - name: tag-version 一致性检查
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          VERS="$(grep -m1 '^version' Cargo.toml | sed 's/version = "\(.*\)"/\1/')"
+          [ "$TAG" = "$VERS" ] || { echo "tag v$TAG 与 Cargo.toml version $VERS 不一致"; exit 1; }
+
+      - name: crates.io OIDC 认证
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: publish
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
